@@ -1,69 +1,83 @@
-// ملف واحد فقط! يستضيف على railway.app مجانًا
 const express = require('express');
 const crypto = require('crypto');
-const mongoose = require('mongoose'); // ⬅️ أضف هذا
-
+const mongoose = require('mongoose');
 const app = express();
+
 app.use(express.json());
 
-// 🔗 الاتصال بقاعدة البيانات MongoDB
-mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost/license_db', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true
-}).then(() => {
-    console.log('✅ متصل بقاعدة البيانات MongoDB');
-}).catch(err => {
-    console.error('❌ خطأ في الاتصال بقاعدة البيانات:', err);
+// اتصال MongoDB
+mongoose.connect(process.env.MONGODB_URI);
+
+// النماذج
+const License = mongoose.model('License', new mongoose.Schema({
+    key: String, ownerId: String, ownerName: String, email: String,
+    status: String, tier: String, price: Number, currency: String,
+    createdAt: Date, expiresAt: Date, lastPaymentDate: Date,
+    nextPaymentDate: Date, autoRenew: Boolean, invoiceCount: Number
+}));
+
+const Invoice = mongoose.model('Invoice', new mongoose.Schema({
+    invoiceId: String, licenseKey: String, amount: Number, currency: String,
+    status: String, paymentMethod: String, transactionId: String,
+    dueDate: Date, paidAt: Date, createdAt: Date
+}));
+
+// نقاط API الرئيسية
+app.post('/verify', async (req, res) => {
+    const { licenseKey, botId, signature } = req.body;
+    
+    const license = await License.findOne({ key: licenseKey });
+    if (!license) return res.json({ valid: false, reason: 'LICENSE_NOT_FOUND' });
+    if (license.status !== 'active') return res.json({ valid: false, reason: `LICENSE_${license.status.toUpperCase()}` });
+    if (new Date() > license.expiresAt) {
+        license.status = 'expired';
+        await license.save();
+        return res.json({ valid: false, reason: 'LICENSE_EXPIRED' });
+    }
+    
+    res.json({ valid: true, expiry: license.expiresAt, tier: license.tier });
 });
 
-// 📋 نموذج الرخصة في MongoDB
-const licenseSchema = new mongoose.Schema({
-    key: { type: String, unique: true, required: true },
-    ownerId: { type: String, required: true },
-    ownerName: { type: String },
-    email: { type: String },
-    status: { 
-        type: String, 
-        enum: ['active', 'suspended', 'expired', 'pending_payment'],
-        default: 'active'
-    },
-    tier: { 
-        type: String, 
-        enum: ['basic', 'premium', 'enterprise'],
-        default: 'premium'
-    },
-    price: { type: Number, default: 0 },
-    currency: { type: String, default: 'USD' },
-    paymentStatus: { type: String, default: 'paid' },
-    createdAt: { type: Date, default: Date.now },
-    expiresAt: { type: Date, required: true },
-    lastPaymentDate: { type: Date },
-    nextPaymentDate: { type: Date },
-    autoRenew: { type: Boolean, default: true },
-    invoiceCount: { type: Number, default: 0 }
+app.post('/admin/create', async (req, res) => {
+    if (req.body.adminKey !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const licenseKey = 'KJL-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+    const expiry = new Date();
+    expiry.setDate(expiry.getDate() + (req.body.days || 30));
+    
+    const license = new License({
+        key: licenseKey,
+        ownerId: req.body.owner,
+        status: 'active',
+        tier: 'premium',
+        price: req.body.price || 0,
+        expiresAt: expiry,
+        autoRenew: true,
+        invoiceCount: 0
+    });
+    
+    await license.save();
+    res.json({ licenseKey, expiry: expiry.toISOString() });
 });
 
-const License = mongoose.model('License', licenseSchema);
-
-// 📋 نموذج الفواتير
-const invoiceSchema = new mongoose.Schema({
-    invoiceId: { type: String, unique: true, required: true },
-    licenseKey: { type: String, required: true },
-    amount: { type: Number, required: true },
-    currency: { type: String, default: 'USD' },
-    status: { 
-        type: String, 
-        enum: ['pending', 'paid', 'failed', 'refunded'],
-        default: 'pending'
-    },
-    paymentMethod: { type: String },
-    transactionId: { type: String },
-    dueDate: { type: Date },
-    paidAt: { type: Date },
-    createdAt: { type: Date, default: Date.now }
+// نقاط API جديدة
+app.get('/licenses', async (req, res) => {
+    if (req.headers['admin-key'] !== process.env.ADMIN_KEY) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const filter = req.query.filter || 'all';
+    let query = {};
+    
+    if (filter === 'active') query.status = 'active';
+    if (filter === 'expired') query.status = 'expired';
+    if (filter === 'suspended') query.status = 'suspended';
+    
+    const licenses = await License.find(query).sort({ createdAt: -1 });
+    res.json({ licenses });
 });
-
-const Invoice = mongoose.model('Invoice', invoiceSchema);
 
 // 📋 إنشاء فاتورة جديدة
 app.post('/invoice/create', async (req, res) => {
@@ -158,121 +172,24 @@ app.post('/invoice/pay', async (req, res) => {
     }
 });
 
-// 📋 التحقق من الفواتير المستحقة
-app.get('/invoice/check-due', async (req, res) => {
-    try {
-        const today = new Date();
-        const threeDaysLater = new Date();
-        threeDaysLater.setDate(today.getDate() + 3);
-        
-        // البحث عن الفواتير المستحقة خلال 3 أيام
-        const dueInvoices = await Invoice.find({
-            status: 'pending',
-            dueDate: { $lte: threeDaysLater, $gte: today }
-        }).populate('licenseKey');
-        
-        // البحث عن الرخص المتأخرة
-        const overdueLicenses = await License.find({
-            status: 'active',
-            nextPaymentDate: { $lt: today }
-        });
-        
-        res.json({
-            dueInvoices: dueInvoices.length,
-            overdueLicenses: overdueLicenses.length,
-            details: {
-                dueInvoices,
-                overdueLicenses: overdueLicenses.map(l => ({
-                    key: l.key,
-                    ownerId: l.ownerId,
-                    nextPaymentDate: l.nextPaymentDate
-                }))
-            }
-        });
-        
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// قاعدة بيانات بسيطة في الذاكرة
-const licenses = {};
-
-// مفتاح سري لتوقيع الطلبات
-const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key';
-
-// 🔐 إنشاء توقيع للتحقق من الطلبات
-function createSignature(data) {
-    return crypto.createHmac('sha256', SECRET_KEY)
-        .update(JSON.stringify(data))
-        .digest('hex');
-}
-
-// 📝 نقطة نهاية التحقق
-app.post('/verify', (req, res) => {
-    const { licenseKey, botId, timestamp, signature } = req.body;
-    
-    const expectedSig = createSignature({ licenseKey, botId, timestamp }); 
-    
-    if (signature !== expectedSig) {
-        return res.json({ valid: false, reason: 'INVALID_SIGNATURE' });
-    }
-    
-    // البحث عن الرخصة
-    if (!licenses[licenseKey]) {
-        return res.json({ valid: false, reason: 'LICENSE_NOT_FOUND' });
-    }
-    
-    const license = licenses[licenseKey];
-    
-    // التحقق من الصلاحية
-    if (!license.active) {
-        return res.json({ valid: false, reason: 'LICENSE_SUSPENDED' });
-    }
-    
-    if (Date.now() > license.expiry) {
-        return res.json({ valid: false, reason: 'LICENSE_EXPIRED' });
-    }
-    
-    // الرخصة صالحة
-    res.json({
-        valid: true,
-        expiry: license.expiry,
-        tier: license.tier,
-        features: license.features
-    });
-});
-
-// 📋 نقطة نهاية إدارة الرخص (للبوت الأساسي)
-app.post('/admin/create', (req, res) => {
-    const { adminKey, days = 30, owner } = req.body;
-    
-    if (adminKey !== process.env.ADMIN_KEY) {
+app.get('/stats', async (req, res) => {
+    if (req.headers['admin-key'] !== process.env.ADMIN_KEY) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     
-    const licenseKey = 'LIC-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-    const expiry = Date.now() + (days * 24 * 60 * 60 * 1000);
-    
-    licenses[licenseKey] = {
-        key: licenseKey,
-        owner,
-        created: Date.now(),
-        expiry,
-        active: true,
-        tier: 'premium',
-        features: ['all']
-    };
+    const activeLicenses = await License.countDocuments({ status: 'active' });
+    const expiredLicenses = await License.countDocuments({ status: 'expired' });
+    const totalRevenue = await License.aggregate([
+        { $group: { _id: null, total: { $sum: '$price' } } }
+    ]);
     
     res.json({
-        licenseKey,
-        expiry: new Date(expiry).toISOString(),
-        days
+        activeLicenses,
+        expiredLicenses,
+        totalRevenue: totalRevenue[0]?.total || 0,
+        pendingPayments: await Invoice.countDocuments({ status: 'pending' })
     });
 });
 
-// تشغيل السيرفر
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`✅ License server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
