@@ -376,6 +376,106 @@ app.post('/admin/create', async (req, res) => {
     }
 });
 
+// أضف هذا الكود بعد نقطة `/admin/create` وقبل `/licenses`
+
+// ----- إنشاء رخصة تجريبية (7 أيام مجانية) -----
+app.post('/trial/create', async (req, res) => {
+    try {
+        const { discordId, name } = req.body;
+        
+        if (!discordId) {
+            return res.status(400).json({ 
+                error: 'MISSING_DISCORD_ID', 
+                message: 'معرف الديسكورد مطلوب' 
+            });
+        }
+        
+        // التحقق من وجود رخصة تجريبية سابقة لهذا المستخدم
+        const existingTrial = await License.findOne({
+            ownerId: discordId,
+            tier: 'trial',
+            status: 'active'
+        });
+        
+        if (existingTrial && new Date() < existingTrial.expiresAt) {
+            return res.status(400).json({ 
+                error: 'TRIAL_ALREADY_ACTIVE', 
+                message: 'لديك بالفعل رخصة تجريبية نشطة',
+                expiresAt: existingTrial.expiresAt
+            });
+        }
+        
+        // توليد مفتاح تجريبي فريد
+        const trialKey = 'TRIAL-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+        
+        // حساب تاريخ انتهاء (7 أيام)
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 7);
+        
+        // إنشاء الرخصة التجريبية
+        const trialLicense = new License({
+            key: trialKey,
+            ownerId: discordId,
+            ownerName: name || `Trial-User-${discordId.substring(0, 6)}`,
+            tier: 'trial',
+            status: 'active',
+            price: 0,
+            expiresAt: expiresAt,
+            features: ['basic_access', 'trial_features'],
+            notes: 'رخصة تجريبية - 7 أيام مجانية'
+        });
+        
+        await trialLicense.save();
+        
+        res.json({
+            success: true,
+            message: 'تم إنشاء الرخصة التجريبية بنجاح',
+            licenseKey: trialKey,
+            expiresAt: expiresAt.toISOString(),
+            expiresIn: '7 أيام',
+            downloadLink: 'https://your-site.com/trial-bot.zip',
+            note: 'الرخصة التجريبية تنتهي تلقائياً بعد 7 أيام'
+        });
+        
+    } catch (error) {
+        console.error('❌ خطأ في /trial/create:', error);
+        res.status(500).json({ 
+            error: 'SERVER_ERROR', 
+            message: error.message 
+        });
+    }
+});
+
+// ----- نقطة للتحقق من الرخص التجريبية -----
+app.get('/trials/active', async (req, res) => {
+    try {
+        if (!verifyAdminKey(req)) {
+            return res.status(401).json({ error: 'UNAUTHORIZED' });
+        }
+        
+        const activeTrials = await License.find({
+            tier: 'trial',
+            status: 'active',
+            expiresAt: { $gt: new Date() }
+        }).sort({ expiresAt: 1 });
+        
+        res.json({
+            success: true,
+            count: activeTrials.length,
+            trials: activeTrials.map(trial => ({
+                key: trial.key,
+                ownerId: trial.ownerId,
+                ownerName: trial.ownerName,
+                expiresAt: trial.expiresAt,
+                daysLeft: Math.ceil((trial.expiresAt - new Date()) / (1000 * 60 * 60 * 24))
+            }))
+        });
+        
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ----- الحصول على جميع الرخص (للإدارة) -----
 app.get('/licenses', async (req, res) => {
     try {
