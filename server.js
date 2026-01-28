@@ -20,10 +20,10 @@ function createSignature(data) {
 
 // 📝 نقطة نهاية التحقق
 app.post('/verify', (req, res) => {
-    const { licenseKey, botId, signature } = req.body;
+    const { licenseKey, botId, timestamp, signature } = req.body;
     
-    // التحقق من التوقيع
-    const expectedSig = createSignature({ licenseKey, botId });
+    const expectedSig = createSignature({ licenseKey, botId, timestamp }); 
+    
     if (signature !== expectedSig) {
         return res.json({ valid: false, reason: 'INVALID_SIGNATURE' });
     }
