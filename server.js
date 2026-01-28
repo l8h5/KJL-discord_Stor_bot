@@ -161,8 +161,8 @@ app.post('/license/suspend', authMiddleware, async (req, res) => {
     }
 });
 
+// تشغيل السيرفر
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`✅ License Server running on port ${PORT}`);
-    console.log(`🔗 Health Check: http://localhost:${PORT}/health`);
+    console.log(`✅ License server running on port ${PORT}`);
 });
