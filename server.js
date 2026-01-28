@@ -6,14 +6,44 @@ const crypto = require('crypto');
 const app = express();
 app.use(express.json());
 
-// 1. الاتصال بقاعدة البيانات
-mongoose.connect(process.env.MONGODB_URI, {
+// 1. الاتصال بقاعدة البيانات INTERNAL (المهم!)
+const MONGODB_URI = process.env.MONGODB_URI || 
+                   'mongodb://mongo:DclRPBJecWAorZVQrorSSordicvuXCHs@mongodb.railway.internal:27017/license_db';
+
+console.log('🔗 محاولة الاتصال بـ MongoDB...');
+console.log('📦 URI:', MONGODB_URI.replace(/:[^:@]*@/, ':****@')); // إخفاء كلمة المرور
+
+mongoose.connect(MONGODB_URI, {
     useNewUrlParser: true,
-    useUnifiedTopology: true
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 30000, // زمن أطول
+    socketTimeoutMS: 45000
 }).then(() => {
-    console.log('✅ MongoDB Connected');
+    console.log('✅ MongoDB Connected Successfully');
+    console.log('📊 حالة الاتصال:', mongoose.connection.readyState);
 }).catch(err => {
-    console.error('❌ MongoDB Connection Error:', err);
+    console.error('❌ MongoDB Connection Error:', err.message);
+    console.error('🔧 تفاصيل الخطأ:', err);
+});
+
+// 2. نماذج البيانات (كما هي)
+
+// 3. نقطة /health معدلة
+app.get('/health', (req, res) => {
+    const dbStatus = mongoose.connection.readyState;
+    const statusMap = {
+        0: 'disconnected',
+        1: 'connected',
+        2: 'connecting',
+        3: 'disconnecting'
+    };
+    
+    res.json({ 
+        status: dbStatus === 1 ? 'ok' : 'error',
+        database: statusMap[dbStatus] || 'unknown',
+        timestamp: new Date().toISOString(),
+        version: '1.0.0'
+    });
 });
 
 // 2. نماذج البيانات
@@ -129,14 +159,6 @@ app.post('/license/suspend', authMiddleware, async (req, res) => {
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
-});
-
-app.get('/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        timestamp: new Date().toISOString(),
-        version: '1.0.0'
-    });
 });
 
 const PORT = process.env.PORT || 3000;
