@@ -71,7 +71,7 @@ const LicenseSchema = new mongoose.Schema({
     },
     tier: { 
         type: String, 
-        enum: ['basic', 'premium', 'enterprise'],
+        enum: ['basic', 'premium', 'enterprise', 'trial'], // إضافة trial
         default: 'premium' 
     },
     price: { 
@@ -256,16 +256,23 @@ app.post('/verify', async (req, res) => {
 
 // ----- إنشاء رخصة جديدة (للإدارة) -----
 app.post('/admin/create', async (req, res) => {
-    try {
-        // التحقق من المفتاح الإداري
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ 
-                error: 'UNAUTHORIZED',
-                message: 'مفتاح إداري غير صالح' 
-            });
-        }
-        
-        const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
+    if (!verifyAdminKey(req)) {
+        return res.status(401).json({ 
+            error: 'UNAUTHORIZED',
+            message: 'مفتاح إداري غير صالح' 
+        });
+    }
+
+    // ✅ فحص اتصال قاعدة البيانات قبل أي عملية
+    if (mongoose.connection.readyState !== 1) {
+        return res.status(503).json({
+            error: 'DATABASE_NOT_CONNECTED',
+            message: 'قاعدة البيانات غير متصلة حالياً'
+        });
+    }
+
+    const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
+    ...
         
         if (!ownerId) {
             return res.status(400).json({ 
@@ -691,19 +698,27 @@ app.use((err, req, res, next) => {
 // 6. بدء الخادم
 // ====================================================
 
-// استخدام المنفذ من المتغيرات البيئية أو المنفذ الافتراضي
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
 
-app.listen(PORT, HOST, () => {
-    console.log(`=========================================`);
-    console.log(`🚀 خادم الترخيص يعمل على: ${HOST}:${PORT}`);
-    console.log(`📅 الوقت: ${new Date().toLocaleString('ar-SA')}`);
-    console.log(`🌍 البيئة: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`=========================================`);
-});
+async function startServer() {
+    try {
+        await mongoose.connect(MONGODB_URI, mongooseOptions);
+        console.log('✅ اتصال MongoDB ناجح');
 
-// معالجة إغلاق الخادم بشكل أنيق
+        app.listen(PORT, HOST, () => {
+            console.log(`=========================================`);
+            console.log(`🚀 خادم الترخيص يعمل على: ${HOST}:${PORT}`);
+            console.log(`📅 الوقت: ${new Date().toLocaleString('ar-SA')}`);
+            console.log(`🌍 البيئة: ${process.env.NODE_ENV || 'development'}`);
+            console.log(`=========================================`);
+        });
+    } catch (err) {
+        console.error('❌ فشل اتصال MongoDB:', err.message);
+        process.exit(1);
+    }
+}
+
 process.on('SIGTERM', () => {
     console.log('🛑 تلقي إشارة إغلاق، جاري إيقاف الخادم...');
     
@@ -721,3 +736,5 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
     console.error('🚨 وعد مرفوض غير معالج:', reason);
 });
+
+startServer();
