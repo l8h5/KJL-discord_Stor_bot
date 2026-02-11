@@ -1,6 +1,5 @@
 // ====================================================
-// server.js - نظام ترخيص بوتات Discord مع MongoDB
-// النسخة النهائية المصححة - لا تحتوي على أخطاء فادحة
+// server.js - نظام ترخيص بوتات
 // ====================================================
 
 const express = require('express');
@@ -11,17 +10,14 @@ const app = express();
 app.use(express.json());
 
 // ====================================================
-// 1. إعدادات اتصال MongoDB
+// 1. MongoDB
 // ====================================================
 
-// الحصول على رابط الاتصال من المتغيرات البيئية أو استخدام الرابط الداخلي
 const getMongoURI = () => {
     if (process.env.MONGODB_URI) {
         console.log('🔗 استخدام MONGODB_URI من متغيرات البيئة');
         return process.env.MONGODB_URI;
     }
-    
-    // ⚠️ ملاحظة: هذا الرابط تجريبي - ضع رابط MongoDB الخاص بك في Railway Variables
     return 'mongodb://mongo:DclRPBJecWAorZVQrorSSordicvuXCHs@mongodb.railway.internal:27017';
 };
 
@@ -29,7 +25,6 @@ const MONGODB_URI = getMongoURI();
 
 console.log('🔗 بدء الاتصال بقاعدة البيانات...');
 
-// إعدادات اتصال MongoDB محسنة
 const mongooseOptions = {
     useNewUrlParser: true,
     useUnifiedTopology: true,
@@ -51,7 +46,7 @@ mongoose.connect(MONGODB_URI, mongooseOptions)
     });
 
 // ====================================================
-// 2. نماذج البيانات (Schemas)
+// 2. (Schemas)
 // ====================================================
 
 const LicenseSchema = new mongoose.Schema({
@@ -113,7 +108,7 @@ try {
 }
 
 // ====================================================
-// 3. وظائف المساعدة (Helper Functions)
+// 3. (Helper Functions)
 // ====================================================
 
 // توليد مفتاح ترخيص فريد
@@ -128,8 +123,6 @@ function generateLicenseKey() {
     
     return key;
 }
-
-// التحقق من المفتاح الإداري
 function verifyAdminKey(req) {
     const adminKey = req.headers['admin-key'] || req.body.adminKey;
     const expectedKey = process.env.ADMIN_KEY || 'default-admin-key';
@@ -138,10 +131,9 @@ function verifyAdminKey(req) {
 }
 
 // ====================================================
-// 4. نقاط النهاية (Endpoints)
+// 4. (Endpoints)
 // ====================================================
 
-// ----- نقطة الصحة (Health Check) -----
 app.get('/health', async (req, res) => {
     const dbStatus = mongoose.connection.readyState;
     const statusMap = {
@@ -179,7 +171,6 @@ app.get('/health', async (req, res) => {
     res.json(healthData);
 });
 
-// ----- التحقق من الرخصة (للبوتات) -----
 app.post('/verify', async (req, res) => {
     try {
         const { licenseKey, botId } = req.body;
