@@ -272,14 +272,14 @@ app.post('/admin/create', async (req, res) => {
     }
 
     const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
-    ...
-        
-        if (!ownerId) {
-            return res.status(400).json({ 
-                error: 'MISSING_OWNER_ID',
-                message: 'معرف المالك مطلوب' 
-            });
-        }
+
+    if (!ownerId) {
+        return res.status(400).json({ 
+            error: 'MISSING_OWNER_ID',
+            message: 'معرف المالك مطلوب' 
+        });
+    }
+
         
         // توليد مفتاح فريد
         let licenseKey;
