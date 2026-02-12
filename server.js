@@ -256,72 +256,71 @@ app.post('/verify', async (req, res) => {
 
 // ----- إنشاء رخصة جديدة (للإدارة) -----
 app.post('/admin/create', async (req, res) => {
-    if (!verifyAdminKey(req)) {
-        return res.status(401).json({ 
-            error: 'UNAUTHORIZED',
-            message: 'مفتاح إداري غير صالح' 
-        });
-    }
+    try {
 
-    // ✅ فحص اتصال قاعدة البيانات قبل أي عملية
-    if (mongoose.connection.readyState !== 1) {
-        return res.status(503).json({
-            error: 'DATABASE_NOT_CONNECTED',
-            message: 'قاعدة البيانات غير متصلة حالياً'
-        });
-    }
+        if (!verifyAdminKey(req)) {
+            return res.status(401).json({ 
+                error: 'UNAUTHORIZED',
+                message: 'مفتاح إداري غير صالح' 
+            });
+        }
 
-    const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
+        // فحص اتصال قاعدة البيانات
+        if (mongoose.connection.readyState !== 1) {
+            return res.status(503).json({
+                error: 'DATABASE_NOT_CONNECTED',
+                message: 'قاعدة البيانات غير متصلة حالياً'
+            });
+        }
 
-    if (!ownerId) {
-        return res.status(400).json({ 
-            error: 'MISSING_OWNER_ID',
-            message: 'معرف المالك مطلوب' 
-        });
-    }
+        const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
 
-        
+        if (!ownerId) {
+            return res.status(400).json({ 
+                error: 'MISSING_OWNER_ID',
+                message: 'معرف المالك مطلوب' 
+            });
+        }
+
         // توليد مفتاح فريد
         let licenseKey;
         let isUnique = false;
         let attempts = 0;
         const maxAttempts = 5;
-        
+
         while (!isUnique && attempts < maxAttempts) {
             licenseKey = generateLicenseKey();
             attempts++;
-            
+
             try {
                 const existingLicense = await License.findOne({ key: licenseKey });
                 if (!existingLicense) {
                     isUnique = true;
                 }
             } catch (dbError) {
-                // في حالة خطأ قاعدة البيانات، نفترض أنه فريد
-                isUnique = true;
                 console.warn('⚠️  افتراض أن المفتاح فريد بسبب خطأ قاعدة البيانات');
+                isUnique = true;
             }
         }
-        
+
         if (!isUnique) {
             return res.status(500).json({ 
                 error: 'KEY_GENERATION_FAILED',
                 message: 'فشل في توليد مفتاح فريد' 
             });
         }
-        
+
         // حساب تاريخ الانتهاء
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + days);
-        
-        // تحديد الميزات بناءً على الفئة
+
+        // تحديد الميزات
         const features = {
-            'basic': ['basic_access'],
-            'premium': ['basic_access', 'premium_features', 'priority_support'],
-            'enterprise': ['basic_access', 'premium_features', 'priority_support', 'custom_integration']
+            basic: ['basic_access'],
+            premium: ['basic_access', 'premium_features', 'priority_support'],
+            enterprise: ['basic_access', 'premium_features', 'priority_support', 'custom_integration']
         }[tier] || ['basic_access'];
-        
-        // إنشاء الرخصة
+
         const licenseData = {
             key: licenseKey,
             ownerId,
@@ -333,15 +332,15 @@ app.post('/admin/create', async (req, res) => {
             features,
             status: 'active'
         };
-        
+
         let savedLicense;
+
         try {
             const license = new License(licenseData);
             savedLicense = await license.save();
         } catch (saveError) {
             console.error('❌ خطأ في حفظ الرخصة:', saveError.message);
-            
-            // التخزين المؤقت كبديل
+
             return res.json({
                 success: true,
                 licenseKey,
@@ -353,8 +352,8 @@ app.post('/admin/create', async (req, res) => {
                 message: 'تم إنشاء الرخصة (مخزنة مؤقتاً)'
             });
         }
-        
-        res.json({
+
+        return res.json({
             success: true,
             licenseKey,
             expiresAt: expiresAt.toISOString(),
@@ -364,10 +363,10 @@ app.post('/admin/create', async (req, res) => {
             id: savedLicense._id,
             message: 'تم إنشاء الرخصة بنجاح'
         });
-        
+
     } catch (error) {
         console.error('❌ خطأ في /admin/create:', error);
-        res.status(500).json({ 
+        return res.status(500).json({ 
             error: 'SERVER_ERROR',
             message: error.message 
         });
