@@ -1,6 +1,6 @@
-// ============
-// server.js -
-// ============
+// ====================================================
+// server.js - نظام ترخيص بوتات Discord - نسخة محسنة بدون HMAC في العميل
+// ====================================================
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -12,6 +12,7 @@ const app = express();
 // ==================== الإعدادات الأساسية ====================
 app.use(express.json({ limit: '10kb' }));
 
+// تمكين CORS
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, admin-key');
@@ -36,15 +37,15 @@ if (!ADMIN_KEY) {
     process.exit(1);
 }
 
-// ==================== حماية من الهجمات (Rate Limiting) ====================
+// ==================== حماية من الهجمات ====================
 const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 دقيقة
-    max: 100, // حد أقصى 100 طلب لكل IP
+    windowMs: 15 * 60 * 1000,
+    max: 100,
     message: { error: 'TOO_MANY_REQUESTS', message: 'طلبات كثيرة جداً، حاول لاحقاً' }
 });
-app.use('/api/', limiter); // تطبيق على جميع مسارات API
+app.use('/api/', limiter);
 
-// ==================== الاتصال بقاعدة بيانات MongoDB ====================
+// ==================== الاتصال بقاعدة البيانات ====================
 let isConnected = false;
 
 const connectDB = async () => {
@@ -58,7 +59,6 @@ const connectDB = async () => {
             socketTimeoutMS: 45000,
             maxPoolSize: 10,
             minPoolSize: 2,
-            // إعدادات إضافية للاستقرار
             retryWrites: true,
             retryReads: true
         });
@@ -66,9 +66,7 @@ const connectDB = async () => {
         isConnected = true;
         console.log('✅ اتصال MongoDB ناجح!');
         console.log(`📊 قاعدة البيانات: ${mongoose.connection.name}`);
-        console.log(`📡 حالة الاتصال: متصل`);
         
-        // الاستماع لأحداث الاتصال
         mongoose.connection.on('disconnected', () => {
             console.log('⚠️ انقطع اتصال MongoDB، محاولة إعادة الاتصال...');
             isConnected = false;
@@ -86,7 +84,6 @@ const connectDB = async () => {
     }
 };
 
-// بدء الاتصال (لا ننتظر حتى يكتمل لنبدأ الخادم)
 connectDB();
 
 // ==================== نماذج البيانات ====================
@@ -115,7 +112,6 @@ const LicenseSchema = new mongoose.Schema({
     notes: String
 });
 
-// تجنب إعادة تعريف النموذج
 const License = mongoose.models.License || mongoose.model('License', LicenseSchema);
 
 // ==================== وظائف مساعدة ====================
@@ -134,7 +130,14 @@ const verifyAdminKey = (req) => {
     return adminKey === ADMIN_KEY;
 };
 
-// ==================== نقطة الصحة (Health Check) ====================
+// ✅ دالة للتحقق من أن الطلب حديث (خلال 5 دقائق)
+function isValidTimestamp(timestamp) {
+    const now = Date.now();
+    const fiveMinutes = 5 * 60 * 1000; // 5 دقائق
+    return timestamp && (now - timestamp) < fiveMinutes && (now - timestamp) > -fiveMinutes;
+}
+
+// ==================== نقطة الصحة ====================
 app.get('/health', async (req, res) => {
     const dbStatus = isConnected ? 'connected' : 'disconnected';
     const connectionState = mongoose.connection.readyState;
@@ -142,7 +145,7 @@ app.get('/health', async (req, res) => {
     const healthData = {
         status: 'ok',
         timestamp: new Date().toISOString(),
-        version: '2.1.0',
+        version: '2.2.0',
         database: {
             status: dbStatus,
             connectionState,
@@ -169,52 +172,62 @@ app.get('/health', async (req, res) => {
 // ==================== التحقق من الرخصة ====================
 app.post('/verify', async (req, res) => {
     try {
-        const { licenseKey, botId } = req.body;
-        
-        if (!licenseKey || !botId) {
-            return res.status(400).json({ 
-                valid: false, 
+        const { licenseKey, botId, timestamp } = req.body;
+
+        // التحقق من وجود البيانات المطلوبة
+        if (!licenseKey || !botId || !timestamp) {
+            return res.status(400).json({
+                valid: false,
                 reason: 'MISSING_DATA',
-                message: 'مفتاح الرخصة ومعرف البوت مطلوبان' 
+                message: 'البيانات غير مكتملة'
             });
         }
-        
-        // إذا كانت قاعدة البيانات غير متصلة، نستخدم التخزين المؤقت
+
+        // ✅ التحقق من حداثة الطلب (بدون HMAC)
+        if (!isValidTimestamp(timestamp)) {
+            return res.status(400).json({
+                valid: false,
+                reason: 'INVALID_TIMESTAMP',
+                message: 'الطلب قديم أو غير صالح'
+            });
+        }
+
+        // إذا كانت قاعدة البيانات غير متصلة
         if (!isConnected) {
-            return res.json({ 
-                valid: true, 
+            return res.json({
+                valid: true,
                 cached: true,
                 expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
                 message: 'تحقق مؤقت - قاعدة البيانات غير متصلة'
             });
         }
-        
+
         const license = await License.findOne({ key: licenseKey }).lean();
-        
+
         if (!license) {
             return res.json({ valid: false, reason: 'LICENSE_NOT_FOUND' });
         }
-        
+
         if (license.status !== 'active') {
             return res.json({ valid: false, reason: `LICENSE_${license.status.toUpperCase()}` });
         }
-        
+
         if (new Date() > license.expiresAt) {
-            // تحديث الحالة في الخلفية (لا ننتظر)
+            // تحديث الحالة في الخلفية
             License.updateOne({ key: licenseKey }, { status: 'expired' }).exec();
             return res.json({ valid: false, reason: 'LICENSE_EXPIRED' });
         }
-        
-        // تحديث وقت التحقق الأخير (لا ننتظر)
+
+        // تحديث وقت التحقق الأخير (في الخلفية)
         License.updateOne({ key: licenseKey }, { lastVerified: new Date() }).exec();
-        
+
         res.json({
             valid: true,
             expiry: license.expiresAt,
             tier: license.tier,
             features: license.features
         });
-        
+
     } catch (error) {
         console.error('❌ خطأ في /verify:', error.message);
         res.status(500).json({ valid: false, reason: 'SERVER_ERROR' });
@@ -367,7 +380,7 @@ app.get('/licenses', async (req, res) => {
         }
         
         const filter = req.query.filter || 'all';
-        const limit = Math.min(parseInt(req.query.limit) || 50, 100); // حد أقصى 100
+        const limit = Math.min(parseInt(req.query.limit) || 50, 100);
         const page = parseInt(req.query.page) || 1;
         const skip = (page - 1) * limit;
         
@@ -483,7 +496,7 @@ app.post('/license/renew', async (req, res) => {
     }
 });
 
-// ==================== عرض الرخص التجريبية النشطة ====================
+// ==================== عرض الرخص التجريبية ====================
 app.get('/trials/active', async (req, res) => {
     try {
         if (!verifyAdminKey(req)) {
@@ -518,12 +531,28 @@ app.get('/trials/active', async (req, res) => {
 
 // ==================== معالجة الأخطاء ====================
 app.use((req, res) => {
-    res.status(404).json({ error: 'NOT_FOUND', message: 'المسار غير موجود' });
+    res.status(404).json({ 
+        error: 'NOT_FOUND', 
+        message: 'المسار غير موجود',
+        availableEndpoints: [
+            'GET /health',
+            'POST /verify',
+            'POST /admin/create',
+            'POST /trial/create',
+            'GET /licenses',
+            'POST /license/suspend',
+            'POST /license/renew',
+            'GET /trials/active'
+        ]
+    });
 });
 
 app.use((err, req, res, next) => {
     console.error('🚨 خطأ غير معالج:', err.stack);
-    res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message: 'حدث خطأ غير متوقع' });
+    res.status(500).json({ 
+        error: 'INTERNAL_SERVER_ERROR', 
+        message: 'حدث خطأ غير متوقع' 
+    });
 });
 
 // ==================== بدء الخادم ====================
