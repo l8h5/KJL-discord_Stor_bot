@@ -1,18 +1,17 @@
-// ====================================================
-// server.js - نظام ترخيص بوتات Discord - نسخة محسنة
-// ====================================================
+// ============
+// server.js -
+// ============
 
 const express = require('express');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit'); // للحماية من الهجمات
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
 // ==================== الإعدادات الأساسية ====================
-app.use(express.json({ limit: '10kb' })); // تحديد حجم الطلبات للحماية
+app.use(express.json({ limit: '10kb' }));
 
-// تمكين الـ CORS للسماح بالاتصال من البوتات
 app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, admin-key');
