@@ -18,7 +18,7 @@ const getMongoURI = () => {
         console.log('🔗 استخدام MONGODB_URI من متغيرات البيئة');
         return process.env.MONGODB_URI;
     }
-    return 'mongodb://mongo:DclRPBJecWAorZVQrorSSordicvuXCHs@mongodb.railway.internal:27017';
+    return 'mongodb+srv://postzxd_db_user:5hP1UjL0dJbP2iIe@cluster0.e0e10t6.mongodb.net/license_db?retryWrites=true&w=majority&appName=Cluster0';
 };
 
 const MONGODB_URI = getMongoURI();
