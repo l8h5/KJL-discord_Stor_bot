@@ -9,7 +9,8 @@
   "dependencies": {
     "express": "^4.18.0",
     "mongoose": "^7.0.0",
-    "crypto": "latest"
+    "crypto": "latest",
+    "express-rate-limit": "latest"
   },
   "engines": {
     "node": ">=16.0.0"
