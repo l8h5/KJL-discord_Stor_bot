@@ -1,123 +1,156 @@
 // ====================================================
-// server.js - نظام ترخيص بوتات Discord - نسخة محسنة بدون HMAC في العميل
+// server.js - نظام ترخيص محصن بأمان متعدد الطبقات
 // ====================================================
-
 const express = require('express');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
 
 const app = express();
 
-// ==================== الإعدادات الأساسية ====================
-app.use(express.json({ limit: '10kb' }));
+// ==================== 1. إعدادات الأمان الأساسية ====================
+app.use(helmet()); // تأمين الرؤوس
+app.use(express.json({ limit: '5kb' })); // تحديد حجم الطلبات
 
-// تمكين CORS
+// تمكين CORS بشكل آمن
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGINS || '*');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, admin-key');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
     next();
 });
 
-// ==================== متغيرات البيئة ====================
+// ==================== 2. Rate Limiting متعدد المستويات ====================
+const globalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 دقيقة
+    max: 200, // حد عام
+    message: { error: 'TOO_MANY_REQUESTS', message: 'طلبات كثيرة جداً، حاول لاحقاً' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+app.use('/api/', globalLimiter);
+
+// حدود أشد للتحقق من الرخصة
+const verifyLimiter = rateLimit({
+    windowMs: 60 * 1000, // دقيقة واحدة
+    max: 20, // 20 طلب في الدقيقة كحد أقصى
+    message: { error: 'RATE_LIMIT', message: 'طلبات تحقق كثيرة جداً' },
+});
+
+// حدود أشد لنقاط الإدارة
+const adminLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 5,
+    message: { error: 'ADMIN_RATE_LIMIT', message: 'طلبات إدارة كثيرة جداً' },
+});
+
+// ==================== 3. متغيرات البيئة ====================
 const {
     MONGODB_URI,
     ADMIN_KEY,
+    ENCRYPTION_KEY, // مفتاح لتشفير البيانات الحساسة (يجب أن يكون 32 حرفًا)
     NODE_ENV = 'development',
     PORT = 3000
 } = process.env;
 
-if (!MONGODB_URI) {
-    console.error('❌ متغير MONGODB_URI غير موجود!');
+if (!MONGODB_URI || !ADMIN_KEY || !ENCRYPTION_KEY) {
+    console.error('❌ متغيرات البيئة مفقودة!');
     process.exit(1);
 }
 
-if (!ADMIN_KEY) {
-    console.error('❌ متغير ADMIN_KEY غير موجود!');
+// التحقق من قوة ADMIN_KEY
+if (ADMIN_KEY.length < 16) {
+    console.error('❌ ADMIN_KEY ضعيف جداً - يجب أن يكون 16 حرفًا على الأقل');
     process.exit(1);
 }
 
-// ==================== حماية من الهجمات ====================
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    message: { error: 'TOO_MANY_REQUESTS', message: 'طلبات كثيرة جداً، حاول لاحقاً' }
-});
-app.use('/api/', limiter);
+// ==================== 4. دالة تشفير البيانات الحساسة ====================
+const algorithm = 'aes-256-gcm';
+const ivLength = 16;
 
-// ==================== الاتصال بقاعدة البيانات ====================
-let isConnected = false;
+function encrypt(text) {
+    const iv = crypto.randomBytes(ivLength);
+    const cipher = crypto.createCipheriv(algorithm, Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+}
 
+function decrypt(encryptedText) {
+    const [ivHex, authTagHex, encrypted] = encryptedText.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const decipher = crypto.createDecipheriv(algorithm, Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+}
+
+// ==================== 5. الاتصال بقاعدة البيانات مع TLS ====================
 const connectDB = async () => {
     try {
-        console.log('🔄 محاولة الاتصال بـ MongoDB...');
-        
         await mongoose.connect(MONGODB_URI, {
             useNewUrlParser: true,
             useUnifiedTopology: true,
-            serverSelectionTimeoutMS: 10000,
+            serverSelectionTimeoutMS: 5000,
             socketTimeoutMS: 45000,
+            ssl: true, // إجباري لـ TLS
+            retryWrites: true,
+            retryReads: true,
             maxPoolSize: 10,
             minPoolSize: 2,
-            retryWrites: true,
-            retryReads: true
         });
-        
-        isConnected = true;
-        console.log('✅ اتصال MongoDB ناجح!');
-        console.log(`📊 قاعدة البيانات: ${mongoose.connection.name}`);
-        
-        mongoose.connection.on('disconnected', () => {
-            console.log('⚠️ انقطع اتصال MongoDB، محاولة إعادة الاتصال...');
-            isConnected = false;
-        });
-        
-        mongoose.connection.on('reconnected', () => {
-            console.log('✅ تم إعادة الاتصال بـ MongoDB');
-            isConnected = true;
-        });
-        
+        console.log('✅ MongoDB متصل بشكل آمن');
     } catch (error) {
-        console.error('❌ فشل الاتصال بـ MongoDB:', error.message);
-        console.log('⚠️ النظام سيعمل في وضع التخزين المؤقت');
-        isConnected = false;
+        console.error('❌ فشل الاتصال بقاعدة البيانات:', error.message);
+        process.exit(1);
     }
 };
-
 connectDB();
 
-// ==================== نماذج البيانات ====================
-const LicenseSchema = new mongoose.Schema({
+// ==================== 6. نموذج الرخصة مع تشفير HWID ====================
+const licenseSchema = new mongoose.Schema({
     key: { type: String, unique: true, required: true, index: true },
     ownerId: { type: String, required: true, index: true },
     ownerName: String,
-    email: String,
-    status: { 
-        type: String, 
+    encryptedHwid: String, // HWID مشفر
+    status: {
+        type: String,
         enum: ['active', 'suspended', 'expired', 'pending'],
         default: 'active',
         index: true
     },
-    tier: { 
-        type: String, 
-        enum: ['basic', 'premium', 'enterprise', 'trial'],
-        default: 'premium' 
-    },
+    tier: { type: String, enum: ['basic', 'premium', 'enterprise', 'trial'], default: 'premium' },
     price: { type: Number, default: 0 },
     currency: { type: String, default: 'USD' },
     createdAt: { type: Date, default: Date.now, index: true },
     expiresAt: { type: Date, required: true, index: true },
-    features: { type: [String], default: ['basic_access'] },
     lastVerified: Date,
+    ipHistory: [String], // تسجيل عناوين IP للكشف عن النشاط المشبوه
     notes: String
+}, { timestamps: true });
+
+// دالة افتراضية للوصول إلى HWID بعد فك التشفير
+licenseSchema.virtual('hwid').get(function() {
+    if (!this.encryptedHwid) return null;
+    return decrypt(this.encryptedHwid);
 });
 
-const License = mongoose.models.License || mongoose.model('License', LicenseSchema);
+licenseSchema.virtual('hwid').set(function(value) {
+    if (value) this.encryptedHwid = encrypt(value);
+});
 
-// ==================== وظائف مساعدة ====================
+const License = mongoose.model('License', licenseSchema);
+
+// ==================== 7. دوال مساعدة ====================
 const generateLicenseKey = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let key = 'Dream-';
+    let key = 'DREAM-';
     for (let i = 0; i < 12; i++) {
         key += chars.charAt(Math.floor(Math.random() * chars.length));
         if ((i + 1) % 4 === 0 && i < 11) key += '-';
@@ -127,444 +160,252 @@ const generateLicenseKey = () => {
 
 const verifyAdminKey = (req) => {
     const adminKey = req.headers['admin-key'] || req.body.adminKey;
-    return adminKey === ADMIN_KEY;
+    return bcrypt.compareSync(adminKey, ADMIN_KEY); // مقارنة آمنة
 };
 
-// ✅ دالة للتحقق من أن الطلب حديث (خلال 5 دقائق)
-function isValidTimestamp(timestamp) {
-    const now = Date.now();
-    const fiveMinutes = 5 * 60 * 1000; // 5 دقائق
-    return timestamp && (now - timestamp) < fiveMinutes && (now - timestamp) > -fiveMinutes;
-}
+// تسجيل جميع الطلبات الإدارية
+const logAdminAction = async (action, adminId, details) => {
+    console.log(`[ADMIN] ${new Date().toISOString()} - ${action} by ${adminId}: ${details}`);
+    // يمكن حفظ السجلات في قاعدة بيانات منفصلة
+};
 
-// ==================== نقطة الصحة ====================
-app.get('/health', async (req, res) => {
-    const dbStatus = isConnected ? 'connected' : 'disconnected';
-    const connectionState = mongoose.connection.readyState;
-    
-    const healthData = {
-        status: 'ok',
+// ==================== 8. نقاط API مع التحقق من المدخلات ====================
+
+// ----- نقطة الصحة -----
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
         timestamp: new Date().toISOString(),
-        version: '2.2.0',
-        database: {
-            status: dbStatus,
-            connectionState,
-            cached: !isConnected
-        },
-        server: {
-            uptime: process.uptime(),
-            memory: process.memoryUsage()
-        },
-        env: NODE_ENV
-    };
-    
-    if (isConnected) {
-        try {
-            healthData.database.licenseCount = await License.countDocuments();
-        } catch (err) {
-            healthData.database.error = err.message;
-        }
-    }
-    
-    res.json(healthData);
-});
-
-// ==================== التحقق من الرخصة ====================
-app.post('/verify', async (req, res) => {
-    try {
-        const { licenseKey, botId, timestamp } = req.body;
-
-        // التحقق من وجود البيانات المطلوبة
-        if (!licenseKey || !botId || !timestamp) {
-            return res.status(400).json({
-                valid: false,
-                reason: 'MISSING_DATA',
-                message: 'البيانات غير مكتملة'
-            });
-        }
-
-        // ✅ التحقق من حداثة الطلب (بدون HMAC)
-        if (!isValidTimestamp(timestamp)) {
-            return res.status(400).json({
-                valid: false,
-                reason: 'INVALID_TIMESTAMP',
-                message: 'الطلب قديم أو غير صالح'
-            });
-        }
-
-        // إذا كانت قاعدة البيانات غير متصلة
-        if (!isConnected) {
-            return res.json({
-                valid: true,
-                cached: true,
-                expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-                message: 'تحقق مؤقت - قاعدة البيانات غير متصلة'
-            });
-        }
-
-        const license = await License.findOne({ key: licenseKey }).lean();
-
-        if (!license) {
-            return res.json({ valid: false, reason: 'LICENSE_NOT_FOUND' });
-        }
-
-        if (license.status !== 'active') {
-            return res.json({ valid: false, reason: `LICENSE_${license.status.toUpperCase()}` });
-        }
-
-        if (new Date() > license.expiresAt) {
-            // تحديث الحالة في الخلفية
-            License.updateOne({ key: licenseKey }, { status: 'expired' }).exec();
-            return res.json({ valid: false, reason: 'LICENSE_EXPIRED' });
-        }
-
-        // تحديث وقت التحقق الأخير (في الخلفية)
-        License.updateOne({ key: licenseKey }, { lastVerified: new Date() }).exec();
-
-        res.json({
-            valid: true,
-            expiry: license.expiresAt,
-            tier: license.tier,
-            features: license.features
-        });
-
-    } catch (error) {
-        console.error('❌ خطأ في /verify:', error.message);
-        res.status(500).json({ valid: false, reason: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== إنشاء رخصة جديدة (للإدارة) ====================
-app.post('/admin/create', async (req, res) => {
-    try {
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ error: 'UNAUTHORIZED' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ 
-                error: 'DATABASE_NOT_CONNECTED',
-                message: 'قاعدة البيانات غير متصلة حالياً، حاول لاحقاً' 
-            });
-        }
-        
-        const { ownerId, days = 30, price = 0, tier = 'premium', email, ownerName } = req.body;
-        
-        if (!ownerId) {
-            return res.status(400).json({ error: 'MISSING_OWNER_ID' });
-        }
-        
-        // توليد مفتاح فريد
-        let licenseKey;
-        let attempts = 0;
-        const maxAttempts = 5;
-        
-        do {
-            licenseKey = generateLicenseKey();
-            attempts++;
-            const existing = await License.findOne({ key: licenseKey });
-            if (!existing) break;
-        } while (attempts < maxAttempts);
-        
-        if (attempts === maxAttempts) {
-            return res.status(500).json({ error: 'KEY_GENERATION_FAILED' });
-        }
-        
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + days);
-        
-        const features = {
-            basic: ['basic_access'],
-            premium: ['basic_access', 'premium_features', 'priority_support'],
-            enterprise: ['basic_access', 'premium_features', 'priority_support', 'custom_integration']
-        }[tier] || ['basic_access'];
-        
-        const license = new License({
-            key: licenseKey,
-            ownerId,
-            ownerName: ownerName || `User-${ownerId.substring(0, 6)}`,
-            email,
-            tier,
-            price,
-            expiresAt,
-            features,
-            status: 'active'
-        });
-        
-        await license.save();
-        
-        res.json({
-            success: true,
-            licenseKey,
-            expiresAt: expiresAt.toISOString(),
-            days,
-            price,
-            tier
-        });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /admin/create:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR', message: error.message });
-    }
-});
-
-// ==================== إنشاء رخصة تجريبية ====================
-app.post('/trial/create', async (req, res) => {
-    try {
-        const { discordId, name } = req.body;
-        
-        if (!discordId) {
-            return res.status(400).json({ error: 'MISSING_DISCORD_ID' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ error: 'DATABASE_NOT_CONNECTED' });
-        }
-        
-        // التحقق من عدم وجود رخصة تجريبية نشطة
-        const existing = await License.findOne({
-            ownerId: discordId,
-            tier: 'trial',
-            status: 'active',
-            expiresAt: { $gt: new Date() }
-        });
-        
-        if (existing) {
-            return res.status(400).json({ 
-                error: 'TRIAL_ALREADY_ACTIVE',
-                expiresAt: existing.expiresAt
-            });
-        }
-        
-        const trialKey = 'TRIAL-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + 7);
-        
-        const trial = new License({
-            key: trialKey,
-            ownerId: discordId,
-            ownerName: name || `Trial-${discordId.substring(0, 6)}`,
-            tier: 'trial',
-            status: 'active',
-            price: 0,
-            expiresAt,
-            features: ['basic_access'],
-            notes: 'رخصة تجريبية - 7 أيام'
-        });
-        
-        await trial.save();
-        
-        res.json({
-            success: true,
-            licenseKey: trialKey,
-            expiresAt: expiresAt.toISOString(),
-            expiresIn: '7 أيام',
-            downloadLink: 'https://your-site.com/trial-bot.zip'
-        });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /trial/create:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== عرض الرخص ====================
-app.get('/licenses', async (req, res) => {
-    try {
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ error: 'UNAUTHORIZED' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ error: 'DATABASE_NOT_CONNECTED' });
-        }
-        
-        const filter = req.query.filter || 'all';
-        const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-        const page = parseInt(req.query.page) || 1;
-        const skip = (page - 1) * limit;
-        
-        const query = filter !== 'all' ? { status: filter } : {};
-        
-        const [licenses, total] = await Promise.all([
-            License.find(query)
-                .sort({ createdAt: -1 })
-                .skip(skip)
-                .limit(limit)
-                .lean(),
-            License.countDocuments(query)
-        ]);
-        
-        res.json({
-            success: true,
-            count: licenses.length,
-            total,
-            page,
-            totalPages: Math.ceil(total / limit),
-            licenses
-        });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /licenses:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== تعليق الرخصة ====================
-app.post('/license/suspend', async (req, res) => {
-    try {
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ error: 'UNAUTHORIZED' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ error: 'DATABASE_NOT_CONNECTED' });
-        }
-        
-        const { licenseKey } = req.body;
-        
-        const result = await License.findOneAndUpdate(
-            { key: licenseKey },
-            { 
-                status: 'suspended',
-                notes: `تم التعليق في: ${new Date().toISOString()}`
-            },
-            { new: true }
-        );
-        
-        if (!result) {
-            return res.status(404).json({ error: 'LICENSE_NOT_FOUND' });
-        }
-        
-        res.json({
-            success: true,
-            license: {
-                key: result.key,
-                status: result.status,
-                ownerId: result.ownerId
-            }
-        });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /license/suspend:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== تجديد الرخصة ====================
-app.post('/license/renew', async (req, res) => {
-    try {
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ error: 'UNAUTHORIZED' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ error: 'DATABASE_NOT_CONNECTED' });
-        }
-        
-        const { licenseKey, days = 30 } = req.body;
-        
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + days);
-        
-        const result = await License.findOneAndUpdate(
-            { key: licenseKey },
-            { 
-                expiresAt,
-                status: 'active',
-                notes: `تم التجديد في: ${new Date().toISOString()} لـ ${days} يوم`
-            },
-            { new: true }
-        );
-        
-        if (!result) {
-            return res.status(404).json({ error: 'LICENSE_NOT_FOUND' });
-        }
-        
-        res.json({
-            success: true,
-            license: {
-                key: result.key,
-                expiresAt: result.expiresAt,
-                status: result.status
-            }
-        });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /license/renew:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== عرض الرخص التجريبية ====================
-app.get('/trials/active', async (req, res) => {
-    try {
-        if (!verifyAdminKey(req)) {
-            return res.status(401).json({ error: 'UNAUTHORIZED' });
-        }
-        
-        if (!isConnected) {
-            return res.status(503).json({ error: 'DATABASE_NOT_CONNECTED' });
-        }
-        
-        const trials = await License.find({
-            tier: 'trial',
-            status: 'active',
-            expiresAt: { $gt: new Date() }
-        }).sort({ expiresAt: 1 }).lean();
-        
-        const result = trials.map(trial => ({
-            key: trial.key,
-            ownerId: trial.ownerId,
-            ownerName: trial.ownerName,
-            expiresAt: trial.expiresAt,
-            daysLeft: Math.ceil((trial.expiresAt - new Date()) / (1000 * 60 * 60 * 24))
-        }));
-        
-        res.json({ success: true, count: result.length, trials: result });
-        
-    } catch (error) {
-        console.error('❌ خطأ في /trials/active:', error.message);
-        res.status(500).json({ error: 'SERVER_ERROR' });
-    }
-});
-
-// ==================== معالجة الأخطاء ====================
-app.use((req, res) => {
-    res.status(404).json({ 
-        error: 'NOT_FOUND', 
-        message: 'المسار غير موجود',
-        availableEndpoints: [
-            'GET /health',
-            'POST /verify',
-            'POST /admin/create',
-            'POST /trial/create',
-            'GET /licenses',
-            'POST /license/suspend',
-            'POST /license/renew',
-            'GET /trials/active'
-        ]
+        version: '3.0.0-secure'
     });
 });
 
+// ----- التحقق من الرخصة -----
+app.post('/verify',
+    verifyLimiter,
+    [
+        body('licenseKey').isString().trim().isLength({ min: 10, max: 50 }),
+        body('hwid').isString().trim().isLength({ min: 8, max: 64 }),
+        body('timestamp').isInt({ min: Date.now() - 300000, max: Date.now() + 300000 }) // في حدود 5 دقائق
+    ],
+    async (req, res) => {
+        // التحقق من صحة المدخلات
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ valid: false, reason: 'INVALID_INPUT', errors: errors.array() });
+        }
+
+        const { licenseKey, hwid, timestamp } = req.body;
+
+        try {
+            const license = await License.findOne({ key: licenseKey });
+
+            if (!license) {
+                return res.json({ valid: false, reason: 'LICENSE_NOT_FOUND' });
+            }
+
+            // التحقق من الحالة
+            if (license.status !== 'active') {
+                return res.json({ valid: false, reason: `LICENSE_${license.status.toUpperCase()}` });
+            }
+
+            // التحقق من تاريخ الانتهاء
+            if (license.expiresAt && new Date() > license.expiresAt) {
+                license.status = 'expired';
+                await license.save();
+                return res.json({ valid: false, reason: 'LICENSE_EXPIRED' });
+            }
+
+            // التحقق من HWID
+            if (license.encryptedHwid) {
+                const storedHwid = license.hwid;
+                if (storedHwid !== hwid) {
+                    // تسجيل محاولة دخول من جهاز مختلف
+                    console.warn(`⚠️ محاولة استخدام الرخصة ${licenseKey} من جهاز مختلف HWID: ${hwid}`);
+                    return res.json({ valid: false, reason: 'HWID_MISMATCH' });
+                }
+            } else {
+                // أول مرة: ربط HWID بالرخصة
+                license.hwid = hwid;
+            }
+
+            // تسجيل IP الحالي
+            const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+            license.ipHistory = license.ipHistory || [];
+            if (!license.ipHistory.includes(clientIp)) {
+                license.ipHistory.push(clientIp);
+                // إذا تغير IP كثيراً، قد يكون مشبوهاً
+                if (license.ipHistory.length > 5) {
+                    console.warn(`⚠️ تغير IP متكرر للرخصة ${licenseKey}`);
+                }
+            }
+
+            license.lastVerified = new Date();
+            await license.save();
+
+            res.json({
+                valid: true,
+                expiresAt: license.expiresAt,
+                tier: license.tier
+            });
+
+        } catch (error) {
+            console.error('❌ خطأ في /verify:', error);
+            res.status(500).json({ valid: false, reason: 'SERVER_ERROR' });
+        }
+    }
+);
+
+// ----- إنشاء رخصة جديدة (مع تحسينات أمان) -----
+app.post('/admin/create',
+    adminLimiter,
+    [
+        body('adminKey').isString().isLength({ min: 8 }),
+        body('ownerId').isString().trim().isLength({ min: 5 }),
+        body('days').optional().isInt({ min: 1, max: 365 }),
+        body('tier').optional().isIn(['basic', 'premium', 'enterprise', 'trial'])
+    ],
+    async (req, res) => {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ error: 'INVALID_INPUT', details: errors.array() });
+        }
+
+        const { adminKey, ownerId, days = 30, tier = 'premium' } = req.body;
+
+        // التحقق من المفتاح الإداري بشكل آمن
+        if (!verifyAdminKey({ headers: { 'admin-key': adminKey } })) {
+            await logAdminAction('UNAUTHORIZED_CREATE', 'unknown', `محاولة إنشاء رخصة بمفتاح غير صالح`);
+            return res.status(401).json({ error: 'UNAUTHORIZED' });
+        }
+
+        try {
+            const licenseKey = generateLicenseKey();
+            const expiresAt = new Date();
+            expiresAt.setDate(expiresAt.getDate() + days);
+
+            const license = new License({
+                key: licenseKey,
+                ownerId,
+                tier,
+                expiresAt,
+                status: 'active'
+            });
+
+            await license.save();
+
+            await logAdminAction('CREATE', ownerId, `رخصة ${licenseKey} لمدة ${days} يوم`);
+
+            res.json({
+                success: true,
+                licenseKey,
+                expiresAt,
+                tier
+            });
+
+        } catch (error) {
+            console.error('❌ خطأ في /admin/create:', error);
+            res.status(500).json({ error: 'SERVER_ERROR' });
+        }
+    }
+);
+
+// ----- تعليق الرخصة -----
+app.post('/admin/suspend',
+    adminLimiter,
+    [
+        body('adminKey').isString().isLength({ min: 8 }),
+        body('licenseKey').isString().trim().isLength({ min: 10 })
+    ],
+    async (req, res) => {
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({ error: 'INVALID_INPUT' });
+        }
+
+        const { adminKey, licenseKey } = req.body;
+
+        if (!verifyAdminKey({ headers: { 'admin-key': adminKey } })) {
+            return res.status(401).json({ error: 'UNAUTHORIZED' });
+        }
+
+        try {
+            const license = await License.findOneAndUpdate(
+                { key: licenseKey },
+                { status: 'suspended' },
+                { new: true }
+            );
+
+            if (!license) {
+                return res.status(404).json({ error: 'LICENSE_NOT_FOUND' });
+            }
+
+            await logAdminAction('SUSPEND', license.ownerId, `تعليق الرخصة ${licenseKey}`);
+
+            res.json({ success: true, message: 'تم تعليق الرخصة' });
+
+        } catch (error) {
+            res.status(500).json({ error: 'SERVER_ERROR' });
+        }
+    }
+);
+
+// ----- عرض الرخص مع فلترة -----
+app.get('/admin/licenses',
+    adminLimiter,
+    async (req, res) => {
+        const adminKey = req.headers['admin-key'] || req.query.adminKey;
+        if (!verifyAdminKey({ headers: { 'admin-key': adminKey } })) {
+            return res.status(401).json({ error: 'UNAUTHORIZED' });
+        }
+
+        try {
+            const { filter = 'all', page = 1, limit = 20 } = req.query;
+            const query = filter !== 'all' ? { status: filter } : {};
+
+            const licenses = await License.find(query)
+                .select('-encryptedHwid') // لا نرسل HWID المشفر أبداً
+                .sort({ createdAt: -1 })
+                .limit(Math.min(parseInt(limit), 100))
+                .skip((parseInt(page) - 1) * parseInt(limit))
+                .lean();
+
+            const total = await License.countDocuments(query);
+
+            res.json({
+                success: true,
+                licenses,
+                total,
+                page: parseInt(page),
+                totalPages: Math.ceil(total / limit)
+            });
+
+        } catch (error) {
+            res.status(500).json({ error: 'SERVER_ERROR' });
+        }
+    }
+);
+
+// ==================== 9. معالجة الأخطاء بشكل آمن ====================
 app.use((err, req, res, next) => {
     console.error('🚨 خطأ غير معالج:', err.stack);
-    res.status(500).json({ 
-        error: 'INTERNAL_SERVER_ERROR', 
-        message: 'حدث خطأ غير متوقع' 
-    });
+    res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message: 'حدث خطأ غير متوقع' });
 });
 
-// ==================== بدء الخادم ====================
+// 404 للمسارات غير الموجودة
+app.use('*', (req, res) => {
+    res.status(404).json({ error: 'NOT_FOUND', message: 'المسار غير موجود' });
+});
+
+// ==================== 10. بدء الخادم ====================
 const server = app.listen(PORT, '0.0.0.0', () => {
     console.log('=========================================');
-    console.log(`🚀 الخادم يعمل على المنفذ ${PORT}`);
-    console.log(`🌍 البيئة: ${NODE_ENV}`);
-    console.log(`🔗 رابط الصحة: /health`);
+    console.log(`🚀 خادم آمن يعمل على المنفذ ${PORT}`);
+    console.log(`🔒 وضع الأمان: ${NODE_ENV === 'production' ? 'إنتاج' : 'تطوير'}`);
     console.log('=========================================');
 });
 
-// إغلاق الاتصال بقاعدة البيانات عند إيقاف الخادم
+// إغلاق آمن
 process.on('SIGTERM', () => {
     console.log('🛑 استقبال SIGTERM، جاري الإغلاق...');
     server.close(() => {
@@ -577,8 +418,10 @@ process.on('SIGTERM', () => {
 
 process.on('uncaughtException', (err) => {
     console.error('🚨 استثناء غير معالج:', err.message);
+    process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
     console.error('🚨 رفض غير معالج:', reason);
+    process.exit(1);
 });
