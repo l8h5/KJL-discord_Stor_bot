@@ -10,7 +10,7 @@ const {
   Routes,
   EmbedBuilder,
 } = require('discord.js');
-
+// system kjl
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_GUILD = process.env.ADMIN_GUILD_ID;
