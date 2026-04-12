@@ -1,14 +1,7 @@
-/**
- * ╔══════════════════════════════════════════════════════════════╗
- * ║ server.js                                                    ║
- * ╚══════════════════════════════════════════════════════════════╝
- **/
-
-// ─── المكتبات ─────────────────────────────────────────────────
 const express = require('express');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite');
 const {
   Client,
   GatewayIntentBits,
@@ -18,67 +11,13 @@ const {
   EmbedBuilder,
 } = require('discord.js');
 
-// ══════════════════════════════════════════════════════════════
-//  [A] إعداد قاعدة البيانات
-// ══════════════════════════════════════════════════════════════
-const db = new Database(process.env.DB_PATH || './licenses.db');
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS licenses (
-    id          TEXT PRIMARY KEY,
-    secret      TEXT NOT NULL,
-    product     TEXT NOT NULL,
-    plan        TEXT NOT NULL DEFAULT 'basic',
-    bound_to    TEXT DEFAULT NULL,
-    expires_at  TEXT DEFAULT NULL,
-    active      INTEGER DEFAULT 1,
-    note        TEXT DEFAULT NULL,
-    created_at  TEXT DEFAULT (datetime('now')),
-    last_seen   TEXT DEFAULT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS heartbeat_tokens (
-    license_id  TEXT PRIMARY KEY,
-    token       TEXT NOT NULL,
-    nonce       TEXT NOT NULL,
-    expires_at  TEXT NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS audit_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    license_id  TEXT,
-    action      TEXT,
-    identifier  TEXT,
-    ip          TEXT,
-    success     INTEGER,
-    reason      TEXT,
-    ts          TEXT DEFAULT (datetime('now'))
-  );
-`);
-
-// ترحيل بسيط إذا كانت قاعدة البيانات قديمة
-function ensureColumn(table, column, definition) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  const exists = cols.some(c => c.name === column);
-  if (!exists) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
-ensureColumn('heartbeat_tokens', 'nonce', 'TEXT NOT NULL DEFAULT ""');
-
-// ══════════════════════════════════════════════════════════════
-//  [B] الإعدادات والمتغيرات العامة
-// ══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
-const SALT = process.env.SECRET_SALT || 'dev-salt-change-this';
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_GUILD = process.env.ADMIN_GUILD_ID;
 const ADMIN_ROLE = process.env.ADMIN_ROLE_ID;
+const DB_PATH = process.env.DB_PATH || './licenses.db';
 
-// ══════════════════════════════════════════════════════════════
-//  [C] دوال مساعدة
-// ══════════════════════════════════════════════════════════════
+const db = new DatabaseSync(DB_PATH);
 
 function getClientIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
@@ -86,14 +25,6 @@ function getClientIp(req) {
     return forwarded.split(',')[0].trim();
   }
   return req.socket?.remoteAddress || 'unknown';
-}
-
-function buildValidatePayload(license_id, identifier) {
-  return `license_id=${license_id}&identifier=${identifier}`;
-}
-
-function buildHeartbeatPayload(license_id, heartbeat_token, nonce) {
-  return `license_id=${license_id}&heartbeat_token=${heartbeat_token}&nonce=${nonce}`;
 }
 
 function generateLicenseId() {
@@ -120,10 +51,22 @@ function audit(licenseId, action, identifier, ip, success, reason = null) {
 function isTimestampFresh(ts) {
   const parsed = Number.parseInt(String(ts), 10);
   if (!Number.isFinite(parsed)) return false;
-
   const now = Math.floor(Date.now() / 1000);
-  const diff = Math.abs(now - parsed);
-  return diff <= 45;
+  return Math.abs(now - parsed) <= 45;
+}
+
+function canonicalize(params) {
+  return Object.entries(params)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+}
+
+function buildValidatePayload(license_id, identifier) {
+  return canonicalize({ license_id, identifier });
+}
+
+function buildHeartbeatPayload(license_id, heartbeat_token, nonce) {
+  return canonicalize({ license_id, heartbeat_token, nonce });
 }
 
 function timingSafeHexEqual(a, b) {
@@ -133,14 +76,17 @@ function timingSafeHexEqual(a, b) {
 
   const bufA = Buffer.from(a, 'hex');
   const bufB = Buffer.from(b, 'hex');
-
   if (bufA.length !== bufB.length) return false;
 
   return crypto.timingSafeEqual(bufA, bufB);
 }
 
 function verifyHMAC(message, clientSecret, receivedSig) {
-  if (typeof message !== 'string' || typeof clientSecret !== 'string' || typeof receivedSig !== 'string') {
+  if (
+    typeof message !== 'string' ||
+    typeof clientSecret !== 'string' ||
+    typeof receivedSig !== 'string'
+  ) {
     return false;
   }
 
@@ -152,11 +98,58 @@ function verifyHMAC(message, clientSecret, receivedSig) {
   return timingSafeHexEqual(expected, receivedSig);
 }
 
-// ══════════════════════════════════════════════════════════════
-//  [D] إعداد خادم Express
-// ══════════════════════════════════════════════════════════════
+function ensureColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  const exists = cols.some((c) => c.name === column);
+  if (!exists) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+try {
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+
+    CREATE TABLE IF NOT EXISTS licenses (
+      id          TEXT PRIMARY KEY,
+      secret      TEXT NOT NULL,
+      product     TEXT NOT NULL,
+      plan        TEXT NOT NULL DEFAULT 'basic',
+      bound_to    TEXT DEFAULT NULL,
+      expires_at  TEXT DEFAULT NULL,
+      active      INTEGER DEFAULT 1,
+      note        TEXT DEFAULT NULL,
+      created_at  TEXT DEFAULT (datetime('now')),
+      last_seen   TEXT DEFAULT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS heartbeat_tokens (
+      license_id  TEXT PRIMARY KEY,
+      token       TEXT NOT NULL,
+      nonce       TEXT NOT NULL,
+      expires_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      license_id  TEXT,
+      action      TEXT,
+      identifier  TEXT,
+      ip          TEXT,
+      success     INTEGER,
+      reason      TEXT,
+      ts          TEXT DEFAULT (datetime('now'))
+    );
+  `);
+
+  ensureColumn('heartbeat_tokens', 'nonce', 'TEXT');
+} catch (err) {
+  console.error('[DB] schema init failed:', err.message);
+  process.exit(1);
+}
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '32kb' }));
 
 const validateLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -164,9 +157,6 @@ const validateLimiter = rateLimit({
   message: { valid: false, error: 'rate_limit_exceeded' },
 });
 
-// ─────────────────────────────────────────────────────────────
-//  نقطة [1]: POST /api/validate
-// ─────────────────────────────────────────────────────────────
 app.post('/api/validate', validateLimiter, (req, res) => {
   const ip = getClientIp(req);
   const timestamp = req.headers['x-timestamp'];
@@ -189,9 +179,7 @@ app.post('/api/validate', validateLimiter, (req, res) => {
     return res.status(403).json({ valid: false, error: 'invalid_license' });
   }
 
-  const payload = buildValidatePayload(license_id, identifier);
-  const message = `${timestamp}:${payload}`;
-
+  const message = `${timestamp}:${buildValidatePayload(license_id, identifier)}`;
   if (!verifyHMAC(message, license.secret, signature)) {
     audit(license_id, 'validate', identifier, ip, false, 'bad_signature');
     return res.status(403).json({ valid: false, error: 'invalid_signature' });
@@ -208,7 +196,7 @@ app.post('/api/validate', validateLimiter, (req, res) => {
   }
 
   if (!license.bound_to) {
-    db.prepare('UPDATE licenses SET bound_to = ?, last_seen = datetime("now") WHERE id = ?')
+    db.prepare("UPDATE licenses SET bound_to = ?, last_seen = datetime('now') WHERE id = ?")
       .run(identifier, license_id);
   } else if (license.bound_to !== identifier) {
     audit(license_id, 'validate', identifier, ip, false, 'wrong_identifier');
@@ -228,7 +216,7 @@ app.post('/api/validate', validateLimiter, (req, res) => {
       expires_at = excluded.expires_at
   `).run(license_id, hbToken, hbNonce, hbExpiry);
 
-  db.prepare('UPDATE licenses SET last_seen = datetime("now") WHERE id = ?').run(license_id);
+  db.prepare("UPDATE licenses SET last_seen = datetime('now') WHERE id = ?").run(license_id);
   audit(license_id, 'validate', identifier, ip, true);
 
   return res.json({
@@ -242,9 +230,6 @@ app.post('/api/validate', validateLimiter, (req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────
-//  نقطة [2]: POST /api/heartbeat
-// ─────────────────────────────────────────────────────────────
 app.post('/api/heartbeat', (req, res) => {
   const ip = getClientIp(req);
   const timestamp = req.headers['x-timestamp'];
@@ -274,7 +259,11 @@ app.post('/api/heartbeat', (req, res) => {
     return res.status(403).json({ alive: false, error: 'token_invalid' });
   }
 
-  const message = `${timestamp}:${buildHeartbeatPayload(license_id, heartbeat_token, record.nonce)}`;
+  const message = `${timestamp}:${buildHeartbeatPayload(
+    license_id,
+    heartbeat_token,
+    record.nonce
+  )}`;
 
   if (!verifyHMAC(message, record.secret, signature)) {
     return res.status(403).json({ alive: false, error: 'bad_signature' });
@@ -302,7 +291,7 @@ app.post('/api/heartbeat', (req, res) => {
     WHERE license_id = ?
   `).run(newToken, newNonce, newExpiry, license_id);
 
-  db.prepare('UPDATE licenses SET last_seen = datetime("now") WHERE id = ?').run(license_id);
+  db.prepare("UPDATE licenses SET last_seen = datetime('now') WHERE id = ?").run(license_id);
 
   return res.json({
     alive: true,
@@ -312,21 +301,18 @@ app.post('/api/heartbeat', (req, res) => {
   });
 });
 
-// ─── صفحة بسيطة للتحقق أن الخادم شغّال ──────────────────────
-app.get('/', (_, res) => res.json({ status: 'online', service: 'license-server' }));
+app.get('/', (_, res) => {
+  res.json({ status: 'online', service: 'license-server', sqlite: 'node:sqlite' });
+});
 
-// تشغيل الخادم
-app.listen(PORT, () => console.log(`[HTTP] خادم الترخيص يعمل على منفذ ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[HTTP] خادم الترخيص يعمل على المنفذ ${PORT}`);
+});
 
-// ══════════════════════════════════════════════════════════════
-//  [E] بوت Discord - واجهة الإدارة
-// ══════════════════════════════════════════════════════════════
 if (!BOT_TOKEN) {
-  console.warn('[BOT] لم يتم تعريف BOT_TOKEN - بوت الإدارة لن يعمل');
+  console.warn('[BOT] BOT_TOKEN غير معرف، بوت الإدارة لن يعمل');
 } else {
-  const discordClient = new Client({
-    intents: [GatewayIntentBits.Guilds],
-  });
+  const discordClient = new Client({ intents: [GatewayIntentBits.Guilds] });
 
   const commands = [
     new SlashCommandBuilder()
@@ -351,10 +337,10 @@ if (!BOT_TOKEN) {
         ))
       .addIntegerOption(o => o
         .setName('days')
-        .setDescription('مدة الصلاحية بالأيام (اتركه فارغاً للترخيص الدائم)'))
+        .setDescription('مدة الصلاحية بالأيام (اختياري)'))
       .addStringOption(o => o
         .setName('note')
-        .setDescription('ملاحظة (اسم العميل مثلاً)')),
+        .setDescription('ملاحظة')),
 
     new SlashCommandBuilder()
       .setName('license-revoke')
@@ -366,7 +352,7 @@ if (!BOT_TOKEN) {
 
     new SlashCommandBuilder()
       .setName('license-unbind')
-      .setDescription('فك ربط الترخيص من الجهاز الحالي')
+      .setDescription('فك ربط الترخيص')
       .addStringOption(o => o
         .setName('id')
         .setDescription('معرّف الترخيص')
@@ -456,7 +442,7 @@ if (!BOT_TOKEN) {
       }
 
       return interaction.reply({
-        content: `🚫 تم إلغاء الترخيص \`${id}\` — سيتوقف الكلاينت عند فشل التحقق التالي.`,
+        content: `🚫 تم إلغاء الترخيص \`${id}\``,
         ephemeral: true,
       });
     }
@@ -470,7 +456,7 @@ if (!BOT_TOKEN) {
       }
 
       return interaction.reply({
-        content: `🔓 تم فك ربط \`${id}\` — سيُربط بالجهاز الجديد في أول استخدام.`,
+        content: `🔓 تم فك ربط \`${id}\``,
         ephemeral: true,
       });
     }
@@ -484,7 +470,6 @@ if (!BOT_TOKEN) {
       }
 
       const statusEmoji = lic.active ? '🟢 فعّال' : '🔴 ملغى';
-
       const embed = new EmbedBuilder()
         .setTitle('معلومات الترخيص')
         .setColor(lic.active ? 0x2ecc71 : 0xe74c3c)
@@ -531,7 +516,7 @@ if (!BOT_TOKEN) {
     }
   });
 
-  discordClient.login(BOT_TOKEN)
-    .then(() => console.log('[BOT] تم تسجيل الدخول'))
-    .catch(err => console.error('[BOT] فشل تسجيل الدخول:', err.message));
+  discordClient.login(BOT_TOKEN).catch(err => {
+    console.error('[BOT] فشل تسجيل الدخول:', err.message);
+  });
 }
