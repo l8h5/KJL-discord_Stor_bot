@@ -593,31 +593,37 @@ app.post('/api/validate', validateLimiter, (req, res) => {
   const { licenseKey, botId } = req.body || {};
 
   if (!licenseKey || !botId || !timestamp || !signature) {
-    return res.status(400).json({
-      valid: false,
-      error: 'missing_fields'
-    });
+    return res.status(400).json({ valid: false, error: 'missing_fields' });
   }
 
-  // check timestamp freshness (45 sec)
+  // 1. timestamp check
   const now = Math.floor(Date.now() / 1000);
-  if (Math.abs(now - Number(timestamp)) > 45) {
-    return res.status(400).json({
-      valid: false,
-      error: 'timestamp_expired'
-    });
+  if (Math.abs(now - Number(timestamp)) > 60) {
+    return res.status(400).json({ valid: false, error: 'timestamp_expired' });
   }
 
-  const license = db.prepare('SELECT * FROM licenses WHERE key = ?').get(licenseKey);
+  const license = db.prepare(
+    'SELECT * FROM licenses WHERE key = ?'
+  ).get(licenseKey);
 
   if (!license) {
-    audit('validate', licenseKey, botId, req.body, ip, false, 'not_found');
     return res.status(403).json({ valid: false, error: 'invalid_license' });
   }
 
-  const message = `${timestamp}:${licenseKey}:${botId}`;
+  // 🔥 FIX #1: canonical message (ثابت 100%)
+  const message = [
+    timestamp,
+    licenseKey,
+    botId
+  ].join(':');
 
-  if (!verifyHMAC(message, license.secret, signature)) {
+  // 🔥 FIX #2: verify HMAC (نفس الطريقة)
+  const expected = crypto
+    .createHmac('sha256', license.secret)
+    .update(message)
+    .digest('hex');
+
+  if (!timingSafeHexEqual(expected, signature)) {
     audit('validate', licenseKey, botId, req.body, ip, false, 'bad_signature');
     return res.status(403).json({ valid: false, error: 'invalid_signature' });
   }
@@ -625,13 +631,10 @@ app.post('/api/validate', validateLimiter, (req, res) => {
   const normalized = rowToLicense(license, { reconcile: true });
 
   if (!isActiveLicense(normalized)) {
-    return res.status(403).json({
-      valid: false,
-      error: 'license_inactive'
-    });
+    return res.status(403).json({ valid: false, error: 'license_inactive' });
   }
 
-  // bind HWID
+  // bind device
   if (!normalized.boundTo) {
     db.prepare(`
       UPDATE licenses
@@ -639,10 +642,7 @@ app.post('/api/validate', validateLimiter, (req, res) => {
       WHERE key = ?
     `).run(botId, nowIso(), nowIso(), licenseKey);
   } else if (normalized.boundTo !== botId) {
-    return res.status(403).json({
-      valid: false,
-      error: 'license_bound_to_another'
-    });
+    return res.status(403).json({ valid: false, error: 'license_bound_to_another' });
   }
 
   return res.json({
