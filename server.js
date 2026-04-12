@@ -586,84 +586,70 @@ function buildHeartbeatPayload(license_id, heartbeat_token, nonce) {
 
 app.post('/api/validate', validateLimiter, (req, res) => {
   const ip = getIp(req);
-  const timestamp = req.headers['x-timestamp'];
+
   const signature = req.headers['x-signature'];
-  const { license_id, identifier } = req.body || {};
+  const timestamp = req.headers['x-timestamp'];
 
-  if (!license_id || !identifier || !timestamp || !signature) {
-    return res.status(400).json({ valid: false, error: 'missing_fields' });
+  const { licenseKey, botId } = req.body || {};
+
+  if (!licenseKey || !botId || !timestamp || !signature) {
+    return res.status(400).json({
+      valid: false,
+      error: 'missing_fields'
+    });
   }
 
-  if (!isTimestampFresh(timestamp)) {
-    audit(license_id, 'validate', identifier, ip, false, 'stale_timestamp');
-    return res.status(400).json({ valid: false, error: 'timestamp_expired' });
+  // check timestamp freshness (45 sec)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - Number(timestamp)) > 45) {
+    return res.status(400).json({
+      valid: false,
+      error: 'timestamp_expired'
+    });
   }
 
-  const license = db.prepare('SELECT * FROM licenses WHERE key = ?').get(license_id);
+  const license = db.prepare('SELECT * FROM licenses WHERE key = ?').get(licenseKey);
 
   if (!license) {
-    audit(license_id, 'validate', identifier, ip, false, 'not_found');
+    audit('validate', licenseKey, botId, req.body, ip, false, 'not_found');
     return res.status(403).json({ valid: false, error: 'invalid_license' });
   }
 
-  const message = `${timestamp}:${buildValidatePayload(license_id, identifier)}`;
+  const message = `${timestamp}:${licenseKey}:${botId}`;
+
   if (!verifyHMAC(message, license.secret, signature)) {
-    audit(license_id, 'validate', identifier, ip, false, 'bad_signature');
+    audit('validate', licenseKey, botId, req.body, ip, false, 'bad_signature');
     return res.status(403).json({ valid: false, error: 'invalid_signature' });
   }
 
   const normalized = rowToLicense(license, { reconcile: true });
 
-  if (!normalized.status || normalized.status === 'suspended') {
-    audit(license_id, 'validate', identifier, ip, false, 'revoked');
-    return res.status(403).json({ valid: false, error: 'license_revoked' });
+  if (!isActiveLicense(normalized)) {
+    return res.status(403).json({
+      valid: false,
+      error: 'license_inactive'
+    });
   }
 
-  if (normalized.expiresAt && new Date(normalized.expiresAt) < new Date()) {
-    audit(license_id, 'validate', identifier, ip, false, 'expired');
-    return res.status(403).json({ valid: false, error: 'license_expired' });
-  }
-
+  // bind HWID
   if (!normalized.boundTo) {
     db.prepare(`
       UPDATE licenses
       SET boundTo = ?, lastSeen = ?, updatedAt = ?
       WHERE key = ?
-    `).run(identifier, nowIso(), nowIso(), license_id);
-  } else if (normalized.boundTo !== identifier) {
-    audit(license_id, 'validate', identifier, ip, false, 'wrong_identifier');
-    return res.status(403).json({ valid: false, error: 'license_bound_to_another' });
+    `).run(botId, nowIso(), nowIso(), licenseKey);
+  } else if (normalized.boundTo !== botId) {
+    return res.status(403).json({
+      valid: false,
+      error: 'license_bound_to_another'
+    });
   }
-
-  const hbToken = generateToken();
-  const hbNonce = generateToken();
-  const hbExpiry = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-
-  db.prepare(`
-    INSERT INTO heartbeat_tokens(licenseKey, token, nonce, expiresAt)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(licenseKey) DO UPDATE SET
-      token = excluded.token,
-      nonce = excluded.nonce,
-      expiresAt = excluded.expiresAt
-  `).run(license_id, hbToken, hbNonce, hbExpiry);
-
-  db.prepare(`
-    UPDATE licenses
-    SET lastSeen = ?, updatedAt = ?
-    WHERE key = ?
-  `).run(nowIso(), nowIso(), license_id);
-
-  audit(license_id, 'validate', identifier, ip, true);
 
   return res.json({
     valid: true,
     plan: normalized.tier,
     product: normalized.product,
-    heartbeat_token: hbToken,
-    heartbeat_nonce: hbNonce,
-    heartbeat_interval: 240,
-    expires_at: normalized.expiresAt || null,
+    expires_at: normalized.expiresAt
   });
 });
 
